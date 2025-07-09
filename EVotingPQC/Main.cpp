@@ -1,4 +1,4 @@
-#include <oqs/oqs.h> //using vcpkg for package managenet
+﻿#include <oqs/oqs.h> //using vcpkg for package managenet
 //then using liboqs for quantum safe algorithms such as Dilithium and Kyber
 #include <stdio.h>
 #include <iostream>
@@ -22,6 +22,7 @@
 #include <openssl/ecdsa.h>    
 #include <openssl/provider.h>
 #include <openssl/rand.h> //for rand bytes
+#include <openssl/hmac.h>   // for HKDF
 
 
 #include <chrono>  // for timing
@@ -206,6 +207,45 @@ bool verify_signature(const std::string& sig_name,
     return ok;
 }
 
+// HKDF-SHA-256 (RFC 5869) – Extract + Expand, single-shot
+bool hkdf_sha256(const uint8_t* secret, size_t secret_len,
+    const uint8_t* info, size_t info_len,
+    uint8_t* out_key, size_t out_len)
+{
+    const size_t HASH_LEN = 32;               // SHA-256 output
+    // ----- HKDF-Extract -----
+    uint8_t prk[HASH_LEN];
+    unsigned int prk_len = 0;
+    HMAC(EVP_sha256(),                         // salt = zero-length
+        nullptr, 0,
+        secret, secret_len,
+        prk, &prk_len);
+
+    // ----- HKDF-Expand -----
+    uint8_t prev[HASH_LEN];
+    size_t pos = 0;
+    uint8_t counter = 1;
+
+    while (pos < out_len) {
+        HMAC_CTX* hctx = HMAC_CTX_new();
+        HMAC_Init_ex(hctx, prk, HASH_LEN, EVP_sha256(), nullptr);
+        if (pos != 0) HMAC_Update(hctx, prev, HASH_LEN);
+        HMAC_Update(hctx, info, info_len);
+        HMAC_Update(hctx, &counter, 1);
+        unsigned int len = 0;
+        HMAC_Final(hctx, prev, &len);
+        HMAC_CTX_free(hctx);
+
+        size_t chunk = min((size_t)HASH_LEN, out_len - pos);
+        memcpy(out_key + pos, prev, chunk);
+        pos += chunk;
+        counter++;
+    }
+    OPENSSL_cleanse(prk, HASH_LEN);
+    OPENSSL_cleanse(prev, HASH_LEN);
+    return true;
+}
+
 
 int main() {
     //init openssl
@@ -217,9 +257,8 @@ int main() {
     const std::string sig_alg = "Dilithium2";
 
 
-    std::vector<uint8_t> kem_pk, kem_sk, ct;
-    std::vector<uint8_t> ss1, ss2;
-    std::vector<uint8_t> sig_pk, sig_sk, sig;
+    std::vector<uint8_t> kem_pk, kem_sk;
+    std::vector<uint8_t> sig_pk, sig_sk;
 
     std::cout << "PRE-ELECTION\n\n";
 
@@ -227,209 +266,204 @@ int main() {
     //Dilithium2 keygen
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (!sig_keygen(sig_alg, sig_pk, sig_sk)) {
-            std::cerr << "Signature keygen failed\n";
-            return 1;
-        }
+        sig_keygen(sig_alg, sig_pk, sig_sk);
         auto t1 = std::chrono::high_resolution_clock::now();
         std::cout << "Dilithium2 keygen: "
             << std::chrono::duration<double, std::milli>(t1 - t0).count()
             << " ms\n\n";
     }
 
-    std::cout << "Generation of Election Keys:\n";
+    std::cout << "Generation of Election Key:\n";
     //Kyber512 keygen
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (!kem_keygen(kem_alg, kem_pk, kem_sk)) {
-            std::cerr << "KEM keygen failed\n";
-            return 1;
-        }
+        kem_keygen(kem_alg, kem_pk, kem_sk);
         auto t1 = std::chrono::high_resolution_clock::now();
-        std::cout << "Election Kyber512 Key generation: "
+        std::cout << "Kyber512 keygen: "
             << std::chrono::duration<double, std::milli>(t1 - t0).count()
             << " ms\n";
     }
-
-    //Kyber encaps
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        if (!kem_encaps(kem_alg, kem_pk, ct, ss1)) {
-            std::cerr << "KEM encapsulation failed\n";
-            return 1;
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cout << "Election Kyber512 Key encapsulation: "
-            << std::chrono::duration<double, std::milli>(t1 - t0).count()
-            << " ms\n";
-    }
-
-    std::cout << "\nDecapsulation of Election Keys for each Tally Auth:\n";
-    //Kyber decaps
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        if (!kem_decaps(kem_alg, ct, kem_sk, ss2)) {
-            std::cerr << "KEM decapsulation failed\n";
-            return 1;
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cout << "Election Kyber512 Key decapsulation: "
-            << std::chrono::duration<double, std::milli>(t1 - t0).count()
-            << " ms\n";
-    }
-
-    //is the shared secret matching?
-    std::cout << "Shared-secret match: "
-        << ((ss1 == ss2) ? "yes" : "no") << "\n\n";
 
     std::cout << "VOTING PHASE (CLIENT SIDE)\n\n";
     // Prompt for vote
     std::string user_input;
-    do {
-        std::cout << "Please cast your vote (yes/no): ";
-        std::cin >> user_input;
-        std::transform(user_input.begin(), user_input.end(), user_input.begin(), ::tolower);
-    } while (user_input != "yes" && user_input != "no");
+    std::cout << "Cast your vote (yes / no): ";
+    std::getline(std::cin, user_input);
+    // Added a check if vote really is yes or no
+    if (user_input != "yes" && user_input != "no") {
+        std::cerr << "Invalid choice\n";
+        return 1;
+    }
+    std::vector<uint8_t> vote_data(user_input.begin(), user_input.end());
 
     //voters choice
-    std::vector<uint8_t> vote_data(user_input.begin(), user_input.end());
 
     std::cout << "\n";
 
-
-    //Encrypt the vote with AES-256-GCM using Kyber shared secret
-    std::vector<uint8_t> encrypted_vote;
-    std::vector<uint8_t> iv(12), tag(16);
-    auto t_enc0 = std::chrono::high_resolution_clock::now();
+    //Kyber encaps (each ballot)
+    std::vector<uint8_t> ctKEM, shared_secret;
     {
-        //Derive AES key from ss1 via SHA-256
-        unsigned char aes_key[32];
-        SHA256(ss1.data(), ss1.size(), aes_key);
-        //Generate random IV
-        RAND_bytes(iv.data(), iv.size());
+        auto t0 = std::chrono::high_resolution_clock::now();
+        kem_encaps(kem_alg, kem_pk, ctKEM, shared_secret);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "Kyber512 encapsulation: "
+            << std::chrono::duration<double, std::milli>(t1 - t0).count()
+            << " ms\n";
+    }
 
+    // Derive AES-256-GCM key from Kyber shared_secret using HKDF_SHA256
+    // The shared_secret will be used just here on the client's machine
+
+    uint8_t aes_key[32];
+    uint8_t iv[12];
+    const uint8_t info[] = "PQC-eVote-AES";
+
+    uint8_t key_iv[sizeof(aes_key) + sizeof(iv)];    // 44 bytes
+    hkdf_sha256(shared_secret.data(), shared_secret.size(),
+        info, sizeof(info) - 1,
+        key_iv, sizeof(key_iv));
+
+    memcpy(aes_key, key_iv, sizeof(aes_key));
+    memcpy(iv, key_iv + sizeof(aes_key), sizeof(iv));
+    OPENSSL_cleanse(key_iv, sizeof(key_iv));
+    // 96-bit nonce
+
+    // Now encrypt the yes/no vote with the derived key
+
+    std::vector<uint8_t> ciphertext(vote_data.size() + 16);   // space for padding
+    int out_len = 0, fin_len = 0;
+    unsigned char tag[16];
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
         EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
         EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, iv.size(), nullptr);
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, aes_key, iv.data());
-
-        int len;
-        encrypted_vote.resize(vote_data.size());
-        EVP_EncryptUpdate(ctx,
-            encrypted_vote.data(), &len,
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(iv), nullptr);
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, aes_key, iv);
+        EVP_EncryptUpdate(ctx, ciphertext.data(), &out_len,
             vote_data.data(), vote_data.size());
-        int ciphertext_len = len;
-
-        EVP_EncryptFinal_ex(ctx,
-            encrypted_vote.data() + len, &len);
-        ciphertext_len += len;
-
-        EVP_CIPHER_CTX_ctrl(ctx,
-            EVP_CTRL_GCM_GET_TAG,
-            tag.size(), tag.data());
+        EVP_EncryptFinal_ex(ctx, ciphertext.data() + out_len, &fin_len);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, sizeof(tag), tag);
         EVP_CIPHER_CTX_free(ctx);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "AES-256-GCM encrypt: "
+            << std::chrono::duration<double, std::milli>(t1 - t0).count()
+            << " ms\n";
     }
-    auto t_enc1 = std::chrono::high_resolution_clock::now();
-    std::cout << "Vote encryption time: "
-        << std::chrono::duration<double, std::milli>(t_enc1 - t_enc0).count()
-        << " ms\n";
+    ciphertext.resize(out_len + fin_len);
+
+    // Build the message: encrypted vote, iv, tag and 
+    // kyber ciphertext that will be used to derive the aes key for each vote
+
+    std::vector<uint8_t> msg;
+    msg.insert(msg.end(), ctKEM.begin(), ctKEM.end());
+    msg.insert(msg.end(), iv, iv + sizeof(iv));
+    msg.insert(msg.end(), ciphertext.begin(), ciphertext.end());
+    msg.insert(msg.end(), tag, tag + sizeof(tag));
 
     //Dilithium2 sign
-    auto t_sig0 = std::chrono::high_resolution_clock::now();
-    if (!sign_message(sig_alg, encrypted_vote, sig_sk, sig)) {
-        std::cerr << "Signing encrypted vote failed\n";
-        return 1;
+    std::vector<uint8_t> signature;
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        sign_message(sig_alg, msg, sig_sk, signature);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "Dilithium2 sign: "
+            << std::chrono::duration<double, std::milli>(t1 - t0).count()
+            << " ms\n";
     }
-    auto t_sig1 = std::chrono::high_resolution_clock::now();
-    std::cout << "Encrypted vote signing time: "
-        << std::chrono::duration<double, std::milli>(t_sig1 - t_sig0).count()
-        << " ms\n\n";
-
 
     std::cout << "Vote is sent to Quorum\n\n";
 
-
-    std::cout << "DECRYPTION PHASE (TALLY SV SIDE)\n\n";
-
     std::cout << "Vote is retrieved from Quorum\n\n";
 
-
-    //Verify the Dilithium2 signature on the encrypted vote
-    auto t_ver0 = std::chrono::high_resolution_clock::now();
-    bool sig_ok = verify_signature(sig_alg, encrypted_vote, sig, sig_pk);
-    auto t_ver1 = std::chrono::high_resolution_clock::now();
-
-    std::cout << "Encrypted vote signature verify time: "
-        << std::chrono::duration<double, std::milli>(t_ver1 - t_ver0).count()
-        << " ms, valid=" << (sig_ok ? "yes" : "no") << "\n";
-
-    if (!sig_ok) {
-        std::cerr << "Signature verification failed�aborting\n";
-        return 1;
-    }
-
-
-    // Decrypt the vote with AES-256-GCM using Kyber shared secret
-    std::vector<uint8_t> decrypted_vote(vote_data.size());
-    auto t_dec0 = std::chrono::high_resolution_clock::now();
-    {
-        // Derive AES key from ss2 via SHA-256
-        unsigned char aes_key[32];
-        SHA256(ss2.data(), ss2.size(), aes_key);
-
-        EVP_CIPHER_CTX* dctx = EVP_CIPHER_CTX_new();
-        EVP_DecryptInit_ex(dctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-        EVP_CIPHER_CTX_ctrl(dctx, EVP_CTRL_GCM_SET_IVLEN, iv.size(), nullptr);
-        EVP_DecryptInit_ex(dctx, nullptr, nullptr, aes_key, iv.data());
-
-        int len;
-        // No AAD in this PoC
-        EVP_DecryptUpdate(dctx, nullptr, &len, nullptr, 0);
-
-        int plaintext_len;
-        EVP_DecryptUpdate(dctx,
-            decrypted_vote.data(), &plaintext_len,
-            encrypted_vote.data(), encrypted_vote.size());
-
-        // Set expected tag
-        EVP_CIPHER_CTX_ctrl(dctx,
-            EVP_CTRL_GCM_SET_TAG,
-            tag.size(), tag.data());
-
-        // Finalize (returns <=0 on auth failure)
-        if (EVP_DecryptFinal_ex(dctx,
-            decrypted_vote.data() + plaintext_len,
-            &len) <= 0) {
-            std::cerr << "Decryption failed: authentication tag mismatch\n";
-        }
-        EVP_CIPHER_CTX_free(dctx);
-    }
-    auto t_dec1 = std::chrono::high_resolution_clock::now();
-    std::string decrypted_vote_str(decrypted_vote.begin(), decrypted_vote.end());
-    std::cout << "Vote decryption time: "
-        << std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count()
-        << " ms\n";
-    std::cout << "Decrypted vote: " << decrypted_vote_str << "\n\n";
-
     std::cout << "TALLY PHASE (TALLY SV SIDE)\n\n";
-    std::cout << "Currently out of scope of this PoC\n\n";
 
+
+
+    //Verify the Dilithium2 signature (a tally could do this)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = verify_signature(sig_alg, msg, signature, sig_pk);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "Dilithium2 verify: "
+            << std::chrono::duration<double, std::milli>(t1 - t0).count()
+            << " ms, valid=" << (ok ? "yes" : "no") << "\n";
+        if (!ok) { std::cerr << "Signature check failed\n"; return 1; }
+    }
+
+
+    // ── 8.  Tally-side Kyber decapsulation  +  AES-GCM decrypt ──────
+    {
+        // 8a.  Recreate shared secret from ctKEM and private key
+        std::vector<uint8_t> shared_secret_tally;
+        auto t_dec0 = std::chrono::high_resolution_clock::now();
+        bool ok_dec = kem_decaps(kem_alg, ctKEM, kem_sk, shared_secret_tally);
+        auto t_dec1 = std::chrono::high_resolution_clock::now();
+
+        if (!ok_dec) {
+            std::cerr << "Kyber decapsulation failed on tally side\n";
+            return 1;
+        }
+        std::cout << "Kyber512 decapsulation (tally): "
+            << std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count()
+            << " ms\n";
+
+        // 8b.  Derive AES key + IV with the SAME HKDF
+        uint8_t aes_key_tally[32];
+        uint8_t iv_tally[12];
+        const uint8_t info[] = "PQC-eVote-AES";
+
+        uint8_t key_iv[sizeof(aes_key_tally) + sizeof(iv_tally)]; // 44 B
+        hkdf_sha256(shared_secret_tally.data(), shared_secret_tally.size(),
+            info, sizeof(info) - 1,
+            key_iv, sizeof(key_iv));
+
+        memcpy(aes_key_tally, key_iv, sizeof(aes_key_tally));
+        memcpy(iv_tally, key_iv + sizeof(aes_key_tally), sizeof(iv_tally));
+        OPENSSL_cleanse(key_iv, sizeof(key_iv));
+
+        // 8c.  AES-256-GCM decrypt and tag-check
+        std::vector<uint8_t> plain(vote_data.size());
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(iv_tally), nullptr);
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, aes_key_tally, iv_tally);
+
+        int len = 0;
+        EVP_DecryptUpdate(ctx, plain.data(), &len,
+            ciphertext.data(), ciphertext.size());
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, sizeof(tag), tag);
+
+        int ret = EVP_DecryptFinal_ex(ctx, plain.data() + len, &len);
+        EVP_CIPHER_CTX_free(ctx);
+
+        auto t_dec2 = std::chrono::high_resolution_clock::now();
+        std::cout << "AES-256-GCM decrypt (tally): "
+            << std::chrono::duration<double, std::milli>(t_dec2 - t_dec1).count()
+            << " ms, success=" << (ret > 0 ? "yes" : "no") << "\n";
+
+        if (ret > 0) {
+            std::string recovered(plain.begin(), plain.begin() + vote_data.size());
+            std::cout << "Decrypted vote = \"" << recovered << "\"\n\n";
+        }
+        else {
+            std::cerr << "Tag verification failed—ballot rejected\n";
+            return 1;
+        }
+    }
 
 
     std::cout << "COMPARISONS\n\n";
    
     // === Classical algorithms for comparison ===
 
-   // Declare these before the RSA block so they�re in scope for both RSA and ECDSA
+   // Declare these before the RSA block so they’re in scope for both RSA and ECDSA
     std::vector<uint8_t> rsa_ct;
     int ct_len = 0;
 
-    // RSA-2048 Keygen + OAEP encrypt/decrypt
+    // RSA-2048 keygen + OAEP encrypt/decrypt
     {
-        // RSA-2048 Keygen
         auto r0 = std::chrono::high_resolution_clock::now();
-        BIGNUM* bn = BN_new();
-        BN_set_word(bn, RSA_F4);
+        BIGNUM* bn = BN_new(); BN_set_word(bn, RSA_F4);
         RSA* rsa = RSA_new();
         RSA_generate_key_ex(rsa, 2048, bn, nullptr);
         BN_free(bn);
@@ -438,44 +472,29 @@ int main() {
             << std::chrono::duration<double, std::milli>(r1 - r0).count()
             << " ms\n";
 
-        // RSA-2048 OAEP encrypt (using vote_data)
         rsa_ct.resize(RSA_size(rsa));
         auto r2 = std::chrono::high_resolution_clock::now();
         ct_len = RSA_public_encrypt(
-            vote_data.size(),
-            vote_data.data(),
-            rsa_ct.data(),
-            rsa,
-            RSA_PKCS1_OAEP_PADDING
-        );
+            vote_data.size(), vote_data.data(),
+            rsa_ct.data(), rsa, RSA_PKCS1_OAEP_PADDING);
         auto r3 = std::chrono::high_resolution_clock::now();
         std::cout << "RSA-2048 OAEP encrypt: "
             << std::chrono::duration<double, std::milli>(r3 - r2).count()
             << " ms\n";
 
-        // RSA-2048 OAEP decrypt
         std::vector<uint8_t> rsa_pt(vote_data.size());
         auto r4 = std::chrono::high_resolution_clock::now();
-        int pt_len = RSA_private_decrypt(
-            ct_len,
-            rsa_ct.data(),
-            rsa_pt.data(),
-            rsa,
-            RSA_PKCS1_OAEP_PADDING
-        );
+        RSA_private_decrypt(ct_len, rsa_ct.data(), rsa_pt.data(),
+            rsa, RSA_PKCS1_OAEP_PADDING);
         auto r5 = std::chrono::high_resolution_clock::now();
         std::cout << "RSA-2048 OAEP decrypt: "
             << std::chrono::duration<double, std::milli>(r5 - r4).count()
-            << " ms, got='"
-            << std::string(rsa_pt.begin(), rsa_pt.begin() + pt_len)
-            << "'\n\n";
-
+            << " ms\n\n";
         RSA_free(rsa);
     }
 
-    // ECDSA-P256 Keygen + Sign + Verify
+    // ECDSA-P256 keygen / sign / verify
     {
-        // ECDSA-P256 Keygen
         auto e0 = std::chrono::high_resolution_clock::now();
         EC_KEY* eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
         EC_KEY_generate_key(eckey);
@@ -484,34 +503,22 @@ int main() {
             << std::chrono::duration<double, std::milli>(e1 - e0).count()
             << " ms\n";
 
-        // ECDSA-P256 sign of the RSA ciphertext
-        unsigned char sig_ec[72];
-        unsigned int sig_ec_len = 0;
+        unsigned char sig_ec[72]; unsigned int sig_ec_len;
         auto e2 = std::chrono::high_resolution_clock::now();
-        ECDSA_sign(
-            0,
-            rsa_ct.data(), ct_len,
-            sig_ec, &sig_ec_len,
-            eckey
-        );
+        ECDSA_sign(0, rsa_ct.data(), ct_len,
+            sig_ec, &sig_ec_len, eckey);
         auto e3 = std::chrono::high_resolution_clock::now();
         std::cout << "ECDSA-P256 sign: "
             << std::chrono::duration<double, std::milli>(e3 - e2).count()
             << " ms\n";
 
-        // ECDSA-P256 verify
         auto e4 = std::chrono::high_resolution_clock::now();
-        int ok_ec = ECDSA_verify(
-            0,
-            rsa_ct.data(), ct_len,
-            sig_ec, sig_ec_len,
-            eckey
-        );
+        int ok_ec = ECDSA_verify(0, rsa_ct.data(), ct_len,
+            sig_ec, sig_ec_len, eckey);
         auto e5 = std::chrono::high_resolution_clock::now();
         std::cout << "ECDSA-P256 verify: "
             << std::chrono::duration<double, std::milli>(e5 - e4).count()
             << " ms, valid=" << ok_ec << "\n";
-
         EC_KEY_free(eckey);
     }
 
