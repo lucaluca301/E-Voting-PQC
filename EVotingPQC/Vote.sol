@@ -4,7 +4,7 @@ pragma solidity 0.8.18;
 /// @title Post-Quantum Ballot Storage (Kyber + AES-GCM + Dilithium)
 /// @author  Luca  –  Master's dissertation PoC
 contract PQCBallotStore {
-    /* ─────────────── Types ─────────────── */
+    // Type
 
     struct Ballot {
         bytes ctKEM;   // Kyber-512 ciphertext (800-ish B)
@@ -14,7 +14,7 @@ contract PQCBallotStore {
         bytes sig;     // Dilithium-2 signature on (ctKEM‖iv‖cipher‖tag)
     }
 
-    /* ─────────────── Storage ───────────── */
+    // Storage
 
     address public immutable admin;                     // deployer
     mapping(address => bool)     public tallyAuth;      // tally servers
@@ -22,7 +22,7 @@ contract PQCBallotStore {
     mapping(address => Ballot)   private ballotOf;      // lookup
     Ballot[]                     private allBallots;    // enumeration
 
-    /* ─────────────── Events ────────────── */
+    // Events
 
     event VoteCast(
         address indexed voter,
@@ -35,14 +35,14 @@ contract PQCBallotStore {
 
     event VoteInvalidated(address indexed voter);
 
-    /* ───────────── Constructor ─────────── */
+    // Constructor
 
     constructor() {
         admin              = msg.sender;
         tallyAuth[msg.sender] = true;   // deployer trusted by default
     }
 
-    /* ──────────  Admin / tally ops ─────── */
+    // Admin Tally operations
 
     modifier onlyAdmin() { require(msg.sender == admin, "not admin"); _; }
     modifier onlyTally() { require(tallyAuth[msg.sender], "not tally"); _; }
@@ -54,7 +54,7 @@ contract PQCBallotStore {
         tallyAuth[acct] = false;
     }
 
-    /* ───────────── Voting API ───────────── */
+    // Voting API
 
     /// @dev  reverts if sender already voted
     function castVote(
@@ -82,7 +82,7 @@ contract PQCBallotStore {
         emit VoteInvalidated(voter);
     }
 
-    /* ───────────── View helpers ─────────── */
+    // View helpers
 
     function ballotsCount() external view returns (uint256) {
         return allBallots.length;
